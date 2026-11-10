@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""
+BB84 Quantum Key Distribution Simulator  (ALL-IN-ONE FILE)
+==========================================================
+Contains: protocol simulator, eavesdropper + noise model, CLI,
+unit tests, QBER-vs-Eve plot, and block-diagram generator.
+
+Requirements:  pip install numpy matplotlib
+
+Usage:
+    python bb84_qkd_simulator.py run -n 2000                  # clean channel
+    python bb84_qkd_simulator.py run -n 2000 --eve 1.0        # eavesdropper
+    python bb84_qkd_simulator.py run -n 2000 --eve 0.3 --noise 0.02 --seed 42
+    python bb84_qkd_simulator.py plot                         # qber_vs_eve.png
+    python bb84_qkd_simulator.py diagrams                     # architecture.png, protocol_flow.png
+    python bb84_qkd_simulator.py test                         # run unit tests
+    python bb84_qkd_simulator.py all                          # tests + plot + diagrams
+
+Bases: 0 = rectilinear (+), 1 = diagonal (x).
+Measuring in the wrong basis gives a random bit; this is what exposes Eve.
+"""
+import argparse
+import unittest
+from dataclasses import dataclass
+
+import numpy as np
+
+QBER_THRESHOLD = 0.11  # commonly cited security bound for BB84
+
+
+# =====================================================================
+# 1. CORE SIMULATOR
+# =====================================================================
+@dataclass
+class BB84Result:
+    n_qubits: int
+    sifted_length: int
+    sample_size: int
+    qber: float
+    eve_detected: bool
+    key_length: int
+    alice_key: np.ndarray
+    bob_key: np.ndarray
+
+    @property
+    def keys_match(self) -> bool:
+        return bool(np.array_equal(self.alice_key, self.bob_key))
+
+
+def _measure(bits, prep_bases, meas_bases, rng):
+    """Same basis -> deterministic result; different basis -> random bit."""
+    random_bits = rng.integers(0, 2, size=len(bits))
+    return np.where(prep_bases == meas_bases, bits, random_bits)
+
+
+def run_bb84(n_qubits=1000, eve_prob=0.0, noise=0.0,
+             sample_fraction=0.25, threshold=QBER_THRESHOLD, seed=None):
+    """Run one BB84 session.
+
+    n_qubits         qubits Alice sends
+    eve_prob         fraction of qubits Eve intercepts (intercept-resend attack)
+    noise            probability the channel flips a bit
+    sample_fraction  share of sifted key publicly compared to estimate QBER
+    threshold        abort if QBER exceeds this
+    seed             RNG seed for reproducibility
+    """
+    rng = np.random.default_rng(seed)
+
+    # 1. Alice picks random bits and bases
+    alice_bits = rng.integers(0, 2, n_qubits)
+    alice_bases = rng.integers(0, 2, n_qubits)
+
+    # 2. Eve (optional) intercepts, measures in a random basis, resends
+    intercepted = rng.random(n_qubits) < eve_prob
+    eve_bases = rng.integers(0, 2, n_qubits)
+    eve_bits = _measure(alice_bits, alice_bases, eve_bases, rng)
+    ch_bits = np.where(intercepted, eve_bits, alice_bits)
+    ch_bases = np.where(intercepted, eve_bases, alice_bases)
+
+    # 3. Channel noise
+    ch_bits = ch_bits ^ (rng.random(n_qubits) < noise).astype(int)
+
+    # 4. Bob measures in random bases
+    bob_bases = rng.integers(0, 2, n_qubits)
+    bob_bits = _measure(ch_bits, ch_bases, bob_bases, rng)
+
+    # 5. Sifting: keep positions where Alice's and Bob's bases match
+    keep = alice_bases == bob_bases
+    a_sift, b_sift = alice_bits[keep], bob_bits[keep]
+    if len(a_sift) == 0:
+        empty = np.array([], dtype=int)
+        return BB84Result(n_qubits, 0, 0, 0.0, False, 0, empty, empty)
+
+    # 6. Error estimation: publicly compare a random sample, then discard it
+    m = max(1, int(len(a_sift) * sample_fraction))
+    idx = rng.permutation(len(a_sift))[:m]
+    qber = float(np.mean(a_sift[idx] != b_sift[idx]))
+    mask = np.ones(len(a_sift), dtype=bool)
+    mask[idx] = False
+
+    detected = qber > threshold
+    a_key = a_sift[mask] if not detected else np.array([], dtype=int)
+    b_key = b_sift[mask] if not detected else np.array([], dtype=int)
+    return BB84Result(n_qubits, len(a_sift), m, qber, detected,
+                      len(a_key), a_key, b_key)
+
+
+# =====================================================================
+# 2. UNIT TESTS  (python bb84_qkd_simulator.py test)
+# =====================================================================
+class TestBB84(unittest.TestCase):
+    def test_no_eve_keys_match(self):
+        r = run_bb84(2000, seed=1)
+        self.assertEqual(r.qber, 0)
+        self.assertTrue(r.keys_match)
+        self.assertFalse(r.eve_detected)
+        self.assertGreater(r.key_length, 0)
+
+    def test_full_eve_qber_near_25_percent(self):
+        r = run_bb84(40000, eve_prob=1.0, seed=2)
+        self.assertLess(abs(r.qber - 0.25), 0.03)
+        self.assertTrue(r.eve_detected)
+        self.assertEqual(r.key_length, 0)
+
+    def test_partial_eve_scales(self):
+        r = run_bb84(40000, eve_prob=0.4, seed=3)
+        self.assertLess(abs(r.qber - 0.10), 0.03)
+
+    def test_small_noise_still_secure(self):
+        self.assertFalse(run_bb84(5000, noise=0.03, seed=4).eve_detected)
+
+    def test_reproducible(self):
+        self.assertEqual(run_bb84(500, seed=7).qber, run_bb84(500, seed=7).qber)
+
+
+def run_tests():
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestBB84)
+    return unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
+
+
+# =====================================================================
+# 3. PLOT: QBER vs Eve interception probability
+# =====================================================================
+def make_plot(path="qber_vs_eve.png"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    probs = np.linspace(0, 1, 11)
+    qbers = [np.mean([run_bb84(4000, p, seed=s).qber for s in range(20)]) for p in probs]
+    plt.figure(figsize=(7, 4.5))
+    plt.plot(probs, qbers, "o-", label="Simulated QBER")
+    plt.plot(probs, probs * 0.25, "--", label="Theory: 0.25 x p")
+    plt.axhline(QBER_THRESHOLD, color="r", ls=":", label="Abort threshold (11%)")
+    plt.xlabel("Eve interception probability")
+    plt.ylabel("QBER")
+    plt.title("BB84: eavesdropper detection")
+    plt.legend()
+    plt.grid(alpha=.3)
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {path}")
+
+
+# =====================================================================
+# 4. BLOCK DIAGRAMS
+# =====================================================================
+def make_diagrams():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+
+    NAVY, TEAL, RED, GREY, GREEN = "#1f3a5f", "#2a9d8f", "#d1495b", "#6c757d", "#3a7d44"
+
+    def box(ax, x, y, w, h, text, color, dashed=False, fs=10):
+        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.02,rounding_size=0.15",
+                                    fc=color if not dashed else "white", ec=color, lw=2,
+                                    ls="--" if dashed else "-"))
+        ax.text(x + w / 2, y + h / 2, text, ha="center", va="center", fontsize=fs,
+                color="white" if not dashed else color, fontweight="bold")
+
+    def arrow(ax, x1, y1, x2, y2, color=NAVY, both=False, ls="-"):
+        ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
+                    arrowprops=dict(arrowstyle="<|-|>" if both else "-|>", color=color, lw=2, ls=ls))
+
+    # ---- System architecture ----
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.set_xlim(0, 12); ax.set_ylim(0, 5); ax.axis("off")
+    box(ax, 0.3, 2.2, 2.4, 1.6, "ALICE\n(Sender)\nbits + bases", NAVY)
+    box(ax, 9.3, 2.2, 2.4, 1.6, "BOB\n(Receiver)\nrandom bases", NAVY)
+    box(ax, 4.8, 0.7, 2.4, 1.1, "EVE (optional)\nintercept-resend", RED, dashed=True)
+    box(ax, 4.6, 3.7, 2.8, 0.9, "Channel noise\n(bit-flip p)", GREY, dashed=True)
+    arrow(ax, 6.0, 3.65, 6.0, 3.1, GREY, ls="--")
+    arrow(ax, 2.8, 3.0, 9.2, 3.0, TEAL)
+    ax.text(3.9, 3.2, "QUANTUM CHANNEL (qubits)", ha="center", fontsize=8.5,
+            color=TEAL, fontweight="bold")
+    arrow(ax, 6.0, 1.85, 6.0, 2.9, RED, ls="--")
+    ax.text(6.0, 0.25, "CLASSICAL AUTHENTICATED CHANNEL: basis comparison + QBER sample",
+            ha="center", fontsize=9, color=GREEN, fontweight="bold")
+    arrow(ax, 2.8, 0.55, 9.2, 0.55, GREEN, both=True)
+    ax.set_title("BB84 QKD Simulator: System Block Diagram", fontsize=14,
+                 fontweight="bold", color=NAVY)
+    fig.savefig("architecture.png", dpi=160, bbox_inches="tight"); plt.close(fig)
+
+    # ---- Protocol pipeline ----
+    fig, ax = plt.subplots(figsize=(14, 5.6))
+    ax.set_xlim(0, 14); ax.set_ylim(0, 5.6); ax.axis("off")
+    steps = ["1. Generate\nrandom bits\n+ bases", "2. Encode\nqubits\n(Alice)",
+             "3. Channel\n(Eve + noise)", "4. Measure\nrandom bases\n(Bob)",
+             "5. Sifting\nkeep matching\nbases", "6. Estimate\nQBER on\nsample"]
+    x = 0.2
+    for i, s in enumerate(steps):
+        box(ax, x, 3.7, 1.9, 1.4, s, NAVY if i != 2 else RED, fs=9)
+        if i < len(steps) - 1:
+            arrow(ax, x + 1.93, 4.4, x + 2.27, 4.4)
+        x += 2.3
+    cx, cy = 11.65, 2.5
+    ax.add_patch(plt.Polygon([[cx, cy + 0.8], [cx + 1.1, cy], [cx, cy - 0.8], [cx - 1.1, cy]],
+                             closed=True, fc="white", ec=NAVY, lw=2))
+    ax.text(cx, cy, "QBER > 11%?", ha="center", va="center", fontsize=9,
+            color=NAVY, fontweight="bold")
+    arrow(ax, cx, 3.65, cx, cy + 0.85)
+    box(ax, 7.6, 0.4, 3.0, 1.0, "ABORT\nEve detected, discard key", RED, fs=9)
+    box(ax, 12.0, 0.4, 1.8, 1.0, "SECRET KEY\nestablished", GREEN, fs=9)
+    arrow(ax, cx - 1.1, cy, 9.1, 1.45, RED)
+    ax.text(9.6, 2.2, "YES", color=RED, fontsize=9, fontweight="bold")
+    arrow(ax, cx + 0.6, cy - 0.45, 12.9, 1.45, GREEN)
+    ax.text(12.7, 2.2, "NO", color=GREEN, fontsize=9, fontweight="bold")
+    ax.set_title("BB84 Protocol Pipeline", fontsize=14, fontweight="bold", color=NAVY)
+    fig.savefig("protocol_flow.png", dpi=160, bbox_inches="tight"); plt.close(fig)
+    print("Saved architecture.png and protocol_flow.png")
+
+
+# =====================================================================
+# 5. COMMAND-LINE INTERFACE
+# =====================================================================
+def cmd_run(a):
+    r = run_bb84(a.qubits, a.eve, a.noise, a.sample, seed=a.seed)
+    print(f"Qubits sent      : {r.n_qubits}")
+    print(f"Sifted key length: {r.sifted_length}")
+    print(f"Sample compared  : {r.sample_size}")
+    print(f"QBER             : {r.qber:.2%}")
+    if r.eve_detected:
+        print("Result           : EAVESDROPPER DETECTED - key discarded")
+    else:
+        print(f"Result           : SECURE - final key length {r.key_length}, "
+              f"keys match: {r.keys_match}")
+        print("Key (first 32)   :", "".join(map(str, r.alice_key[:32])))
+
+
+def main():
+    p = argparse.ArgumentParser(description="BB84 QKD simulator (all-in-one)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("run", help="run one BB84 session")
+    r.add_argument("-n", "--qubits", type=int, default=1000)
+    r.add_argument("--eve", type=float, default=0.0, help="Eve interception probability (0-1)")
+    r.add_argument("--noise", type=float, default=0.0, help="channel bit-flip probability")
+    r.add_argument("--sample", type=float, default=0.25, help="fraction used for QBER check")
+    r.add_argument("--seed", type=int, default=None)
+    r.set_defaults(func=cmd_run)
+
+    sub.add_parser("plot", help="generate qber_vs_eve.png").set_defaults(func=lambda a: make_plot())
+    sub.add_parser("diagrams", help="generate block diagrams").set_defaults(func=lambda a: make_diagrams())
+    sub.add_parser("test", help="run unit tests").set_defaults(func=lambda a: run_tests())
+
+    def do_all(a):
+        run_tests(); make_plot(); make_diagrams()
+    sub.add_parser("all", help="tests + plot + diagrams").set_defaults(func=do_all)
+
+    a = p.parse_args()
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()
