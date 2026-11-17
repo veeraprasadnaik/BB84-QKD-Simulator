@@ -1,4 +1,4 @@
-<h1 align="center">BB84 Quantum Key Distribution Simulator</h1>
+ <h1 align="center">BB84 Quantum Key Distribution Simulator</h1>
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" alt="Python">
